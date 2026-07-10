@@ -1,0 +1,59 @@
+# API access modes: the five ways data leaves a hospital
+
+*Bulk export and REST are complements, not rivals — and neither reaches the ventilator.*
+
+## In plain words
+
+There are five doors out of a hospital's data, and choosing the wrong one wastes months.
+
+Think of them as shipping methods. **Bulk export is a shipping container**: cheap per item, but it arrives on a schedule (once a day at best), and it only carries standard-sized boxes — the government-mandated data elements, nothing exotic. **REST search is a courier**: fast, will carry almost anything you ask for by name, but you pay per parcel and the courier gets annoyed if you send a thousand at once. **HL7 v2 is the hospital's internal mail system** — it has been running for thirty years, every department is wired into it, and it actually knows where the ventilator data is. It is unglamorous and it works. The last two doors — FHIR Subscriptions and device/IoT middleware — are the ones vendors demo and hospitals don't actually open.
+
+The load-bearing insight for our middleware: you use the container to move the whole population cheaply, then you use the courier only for the small slice you actually care about. Run bulk first to build the backbone and find the ICU patients; that filtering shrinks the cohort by roughly an order of magnitude; *then* spend expensive REST calls on that small set to fetch the things bulk refuses to hand over. Reverse the order and the courier bill is unpayable.
+
+And the honest part: even both doors together do not get you ventilator settings, CRRT, ECMO, or prone positioning at any US site we could find. Those live behind door four or five. So the middleware treats "source" as a plug — a signal is a signal whether it arrived as a FHIR Observation or an HL7 v2 OBX segment.
+
+## Technical detail
+
+**1. Synchronous REST search.** `GET [base]/Observation?patient=X&category=vital-signs&date=ge2026-07-01` returns a `Bundle` of type `searchset`. Page by following `Bundle.link` where `relation:"next"` — never build the next-page URL yourself; it carries an opaque continuation/cursor token. `_count` is a page-size *hint* the server may silently cap. US Core defines mandatory search parameters per profile; for Observation the required combination is `patient + category + date` **\[spec\]** ([US Core server CapabilityStatement](https://hl7.org/fhir/us/core/STU6.1/CapabilityStatement-us-core-server.html)). Rate limits are real: Epic throttles per-client (limits vary by customer config) and returns **HTTP 429** under load; Oracle documents 429 (`throttled`) as a first-class response on both sync and bulk. Epic's own guidance prefers Bulk over high-fan-out REST for population loads **\[spec\]**. Correct use: targeted pulls for a *known* cohort of patient IDs over a bounded window — not warehouse-scale extraction. **REST is the only way to get `MedicationAdministration` and Epic's non-US-Core Observation flavors** (flowsheet-derived vitals and scores); they are absent from bulk export. That absence is why REST is our *enrichment* leg after bulk narrows the cohort.
+
+**2. Bulk Data Access ("Flat FHIR" / async).** HL7 Bulk Data Access IG v2.0.0 **\[spec\]** ([export.html](https://hl7.org/fhir/uv/bulkdata/export.html)). Three kickoff endpoints: System `GET [base]/$export`, Patient `GET [base]/Patient/$export`, Group `GET [base]/Group/[id]/$export`. Required headers: `Accept: application/fhir+json` and `Prefer: respond-async`; optional `Prefer: handling=lenient` makes the server ignore unknown params instead of returning 422. Params: `_outputFormat` (default `application/fhir+ndjson`), `_since`, `_type`, `_typeFilter`, `_elements`, and in v2.0.0 the experimental `includeAssociatedData` and `organizeOutputBy`, plus `patient` (Patient-level POST).
+
+Flow: kickoff → `202 Accepted` with a `Content-Location` header = the polling URL. Poll → while running, `202` with advisory `X-Progress` (free text) and `Retry-After`; when done, `200 OK` + a manifest JSON with `transactionTime`, `request`, `requiresAccessToken`, `output[]` (`{type, url, count?}`), `error[]` (OperationOutcome NDJSON), and `deleted[]` (v2.0.0). Download each `output[].url` with `Accept: application/fhir+ndjson` and a bearer token if `requiresAccessToken`. NDJSON is one resource per line; a single resource type can span many files. Cancel by `DELETE`-ing the status URL → `202`. Retention: Oracle documents **30 days**; treat Epic as "download immediately." Correct use: the wide, cheap, whole-population backbone — and the only path certified under ONC (g)(10) for population-level access.
+
+- *Epic reality:* **Group-level export only**; the Group is built by a hospital analyst, not by you; **Epic does not support `_since`** and omits `meta.lastUpdated`, so you window with `_typeFilter` instead; throttled to roughly **one kickoff per Group per \~24 h** ("Request not allowed: The Client requested this Group too recently") **\[community\]**; \~1000 patients per export recommended. ([Cumulus discussion #5](https://github.com/smart-on-fhir/cumulus/discussions/5), [Epic bulk data docs](https://fhir.epic.com/Documentation?docId=fhir_bulk_data))
+- *Oracle reality:* `_since` **is** supported; no all-patient export; Patient export needs an explicit ID list (max 20,000); system-level `$export` is not offered **\[spec\]** ([Oracle bulk export](https://docs.oracle.com/en/industries/health/millennium-platform-apis/mfbda/api-bulk-export.html)).
+
+**3. Subscriptions (push).** R4 `Subscription` with `channel.type = rest-hook` (the server POSTs on a match, often an empty ping). R5 introduced topic-based subscriptions (`SubscriptionTopic`, `SubscriptionStatus`, payload levels `empty` / `id-only` / `full-resource`); the **R4 Subscriptions Backport IG** ports that R5 model back onto R4 **\[spec\]** ([subscriptions.html](https://build.fhir.org/subscriptions.html), [Backport IG](https://argonautproject.github.io/subscription-backport-ig/)). Reality: weakly supported in EHRs. Epic supports Subscription but restricted/registration-gated; HAPI and Medplum support it well **\[community\]**. **Do not architect on FHIR Subscription against Epic or Oracle.**
+
+**4. HL7 v2 messaging.** The pre-FHIR standard, still the real-time workhorse. `ADT^A01` admit, `A02` transfer, `A03` discharge, `A08` update = the census/transfer feed. `ORU^R01` observation result = labs and, crucially, **device/monitor data**. Delivered over MLLP/TCP through an interface engine (Epic Bridges, Cerner interfaces, Mirth, Rhapsody, Corepoint). Reality: **this is the actual low-latency path in every hospital**, and the only practical route to complete transfer history and ICU device data. Epic's near-real-time ADT integration is overwhelmingly HL7 v2, not FHIR Subscription **\[community\]**.
+
+**5. Device / IoT middleware.** Ventilators, monitors, infusion pumps, CRRT and ECMO consoles talk to device middleware (Capsule/Bernoulli, Philips, GE, Epic device connectivity) that normalizes and typically emits HL7 v2 ORU into the EHR flowsheet. FHIR has `Device`, `DeviceMetric`, and the IHE PCD / HL7 Point-of-Care Device IG with ISO/IEEE 11073 mappings **\[spec\]** ([device module](https://build.fhir.org/device-module.html), [PoCD v2 mapping](https://build.fhir.org/ig/HL7/uv-pocd/mappingv2.html)) — but **US EHRs do not expose ICU device or waveform data through them**, and USCDI does not require it. Waveforms (ECG, pleth, arterial-pressure tracings, breath-by-breath vent data) are not on the FHIR clinical surface at all.
+
+### Decision table
+
+| Mode | Latency | Breadth | Depth | Auth | Throttle | Gets us which CLIF tables | Verdict |
+|---------|---------|---------|---------|---------|---------|---------|---------|
+| REST search | Seconds | Narrow (per-patient) | Deep (any named resource) | SMART bearer, per-request | Per-client 429; Epic prefers bulk for population | `medication_admin`, flowsheet-derived `vitals`/scored `patient_assessments`; fills bulk gaps | **Enrichment leg** — only after cohort is small |
+| Bulk export | Hours–1 day | Whole population | Shallow (US Core only) | SMART Backend Services; token per download | Epic \~1/Group/24 h; Oracle ID-list cap | `patient`, `hospitalization`, `adt`, `labs`, basic `vitals` | **Backbone** — run first, always |
+| Subscriptions | Near real-time | Match-scoped | Payload-dependent | Registration-gated | N/A (barely available) | None reliably at Epic/Oracle | **Skip** at big-EHR sites |
+| HL7 v2 | Real-time | Feed-scoped | Deep (labs, devices, transfers) | Interface engine, site-negotiated | N/A (push) | `adt` (complete), `labs`, device-fed `vitals`/`respiratory_support` | **Only route to real-time + devices** |
+| Device/IoT | Real-time | Device-scoped | Very deep (waveforms upstream) | Middleware/site-negotiated | N/A | `respiratory_support`, `crrt_therapy`, `ecmo_mcs` — via HL7 v2 hop | **Required for ICU device signals** |
+
+## Edge cases and how it breaks
+
+- **Constructing next-page URLs.** REST paging tokens are opaque; hand-building `&_getpages=…` or reusing offsets silently drops or duplicates rows. Always follow `link[relation=next]`.
+- **Trusting `_count`.** The server caps it; your "10,000-per-page" request comes back as 100 and your loop terminates early if it assumes a fixed page size.
+- **Assuming `_since` works.** On Epic it does not, and `meta.lastUpdated` is absent, so incremental/delta logic built on it returns everything or nothing — window with `_typeFilter` instead. See [doc 09](09-data-freshness.md).
+- **Re-kicking a Group too soon.** Epic rejects a second export inside \~24 h with "Client requested this Group too recently" **\[community\]**. A retry loop that treats this as transient will hammer a wall.
+- **Manifest expiry.** Oracle keeps output \~30 days; Epic is effectively "download now." A pipeline that kicks off Friday and downloads Monday may find dead URLs.
+- **Fan-out REST on the full population.** Skipping the bulk-first filter and looping REST over every patient trips 429 and, at Epic, violates guidance. The affordability of the enrichment leg *depends on* the inpatient/encounter-class filter having already shrunk the cohort — that ordering is load-bearing.
+- **`requiresAccessToken` handling.** If the manifest says `true`, unauthenticated GETs to output URLs 401; if `false`, some servers reject an *unexpected* bearer. Read the flag, don't assume.
+- **Expecting devices via FHIR.** `Device`/`DeviceMetric`/PoCD exist in the spec but return nothing useful from US EHRs; a plan that budgets vent settings from REST will find empty results at go-live. See [doc 08](08-what-hospitals-actually-provide.md).
+
+## What we still don't know
+
+- **Actual per-site REST throttle numbers.** Epic's 429 thresholds vary by customer config and are not published; we cannot size the enrichment leg until we test against the real endpoint. See [doc 06](06-authentication.md) for how client registration shapes those limits.
+- **Whether our target sites will stand up an HL7 v2 feed for research**, versus keeping it operational-only — the difference between reaching ICU device data and not. See [doc 08](08-what-hospitals-actually-provide.md).
+- **How device-middleware HL7 v2 encodes vent/CRRT/ECMO fields** in OBX segments, and how stably that maps into CLIF `respiratory_support` / `crrt_therapy` / `ecmo_mcs`. See [doc 12](12-clif-events-and-signals.md).
+- **Oracle Group/cohort mechanics for research** — the docs describe ID-list Patient export but not a clean population-cohort workflow at the scale we need.
+- **Whether any target site exposes R4 Subscriptions at all** — worth a one-line capability check, but we are not betting the architecture on a "yes." See [doc 05](05-bulk-export-deep-dive.md) for the path we are betting on.
